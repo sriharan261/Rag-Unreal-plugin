@@ -1,4 +1,3 @@
-Here’s a clean, well-structured Markdown version with improved hierarchy, formatting, and readability:
 
 ---
 
