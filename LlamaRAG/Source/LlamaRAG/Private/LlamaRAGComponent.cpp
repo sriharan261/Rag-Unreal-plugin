@@ -34,8 +34,12 @@ FString ULlamaRAGComponent::GetContentDirectoryPath() const
 
 void ULlamaRAGComponent::LoadModelsAsync(const FString& LLMModelPath, const FString& EmbedModelPath)
 {
-    if (bIsBusy) return;
+    if (bIsBusy) {
+        UE_LOG(LogLlamaRAG, Warning, TEXT("LoadModelsAsync: Component is already busy. Ignoring request."));
+        return;
+    }
     bIsBusy = true;
+    UE_LOG(LogLlamaRAG, Log, TEXT("LoadModelsAsync: Attempting to load LLM from '%s' and Embed Model from '%s'"), *LLMModelPath, *EmbedModelPath);
 
     Async(EAsyncExecution::Thread, [this, LLMModelPath, EmbedModelPath]()
     {
@@ -43,7 +47,8 @@ void ULlamaRAGComponent::LoadModelsAsync(const FString& LLMModelPath, const FStr
         LlmModel = llama_model_load_from_file(TCHAR_TO_UTF8(*LLMModelPath), model_params);
         
         llama_context_params ctx_params = llama_context_default_params();
-        ctx_params.n_ctx = 2048;
+        ctx_params.n_ctx = 4096;   // Increased context size
+        ctx_params.n_batch = 4096; // CRITICAL FIX: Match batch size to context to prevent ggml_cpu crash
         if (LlmModel) LlmContext = llama_init_from_model(LlmModel, ctx_params);
 
         llama_model_params embed_m_params = llama_model_default_params();
@@ -51,9 +56,17 @@ void ULlamaRAGComponent::LoadModelsAsync(const FString& LLMModelPath, const FStr
         
         llama_context_params embed_c_params = llama_context_default_params();
         embed_c_params.embeddings = true;
+        embed_c_params.n_ctx = 4096;   // Protect embedding model too
+        embed_c_params.n_batch = 4096; // CRITICAL FIX
         if (EmbedModel) EmbedContext = llama_init_from_model(EmbedModel, embed_c_params);
 
         bool bSuccess = (LlmContext != nullptr && EmbedContext != nullptr);
+
+        if (bSuccess) {
+            UE_LOG(LogLlamaRAG, Log, TEXT("LoadModelsAsync: Models successfully loaded into memory."));
+        } else {
+            UE_LOG(LogLlamaRAG, Error, TEXT("LoadModelsAsync: Failed to load one or both models. Check file paths and ensure they are valid .gguf files."));
+        }
 
         AsyncTask(ENamedThreads::GameThread, [this, bSuccess]()
         {
@@ -66,9 +79,11 @@ void ULlamaRAGComponent::LoadModelsAsync(const FString& LLMModelPath, const FStr
 // NEW: File Reader Implementation
 void ULlamaRAGComponent::IngestStoryFromFileAsync(const FString& FilePath, int32 ChunkSize)
 {
+    UE_LOG(LogLlamaRAG, Log, TEXT("IngestStoryFromFileAsync: Attempting to load file from '%s'"), *FilePath);
     FString FileContent;
     if (FFileHelper::LoadFileToString(FileContent, *FilePath))
     {
+        UE_LOG(LogLlamaRAG, Log, TEXT("IngestStoryFromFileAsync: File loaded successfully. Length: %d characters."), FileContent.Len());
         IngestStoryAsync(FileContent, ChunkSize);
     }
     else
@@ -80,9 +95,14 @@ void ULlamaRAGComponent::IngestStoryFromFileAsync(const FString& FilePath, int32
 
 void ULlamaRAGComponent::IngestStoryAsync(const FString& StoryText, int32 ChunkSize)
 {
-    if (bIsBusy || !EmbedContext) return;
+    if (bIsBusy || !EmbedContext) {
+        UE_LOG(LogLlamaRAG, Warning, TEXT("IngestStoryAsync aborted. Component Busy: %d, EmbedContext Valid: %d"), bIsBusy, EmbedContext != nullptr);
+        return;
+    }
     bIsBusy = true;
     VectorDB.Empty();
+
+    UE_LOG(LogLlamaRAG, Log, TEXT("IngestStoryAsync: Starting text chunking and embedding. Target Chunk Size: %d"), ChunkSize);
 
     Async(EAsyncExecution::Thread, [this, StoryText, ChunkSize]()
     {
@@ -104,6 +124,8 @@ void ULlamaRAGComponent::IngestStoryAsync(const FString& StoryText, int32 ChunkS
             }
         }
 
+        UE_LOG(LogLlamaRAG, Log, TEXT("IngestStoryAsync: Ingestion complete. Stored %d vector chunks in database."), VectorDB.Num());
+
         AsyncTask(ENamedThreads::GameThread, [this]()
         {
             bIsBusy = false;
@@ -114,8 +136,14 @@ void ULlamaRAGComponent::IngestStoryAsync(const FString& StoryText, int32 ChunkS
 
 void ULlamaRAGComponent::AskQuestionAsync(const FString& Question, int32 TopK)
 {
-    if (bIsBusy || !LlmContext || VectorDB.Num() == 0) return;
+    if (bIsBusy || !LlmContext || VectorDB.Num() == 0) {
+        UE_LOG(LogLlamaRAG, Warning, TEXT("AskQuestionAsync aborted. Busy: %d, LlmContext Valid: %d, DB Size: %d"), bIsBusy, LlmContext != nullptr, VectorDB.Num());
+        return;
+    }
     bIsBusy = true;
+
+    UE_LOG(LogLlamaRAG, Log, TEXT("========== RAG QUERY STARTED =========="));
+    UE_LOG(LogLlamaRAG, Log, TEXT("User Question: %s"), *Question);
 
     Async(EAsyncExecution::Thread, [this, Question, TopK]()
     {
@@ -139,7 +167,13 @@ void ULlamaRAGComponent::AskQuestionAsync(const FString& Question, int32 TopK)
         }
 
         FString Prompt = FString::Printf(TEXT("Context:\n%s\n\nQuestion: %s\nAnswer:"), *Context, *Question);
+        
+        UE_LOG(LogLlamaRAG, Log, TEXT("--- Constructed Prompt Sent to LLM ---\n%s\n--------------------------------------"), *Prompt);
+        
         FString FinalAnswer = GenerateTextInternal(Prompt);
+
+        UE_LOG(LogLlamaRAG, Log, TEXT("--- LLM Output Received ---\n%s\n---------------------------"), *FinalAnswer);
+        UE_LOG(LogLlamaRAG, Log, TEXT("========== RAG QUERY FINISHED =========="));
 
         AsyncTask(ENamedThreads::GameThread, [this, FinalAnswer]()
         {
@@ -162,6 +196,11 @@ TArray<float> ULlamaRAGComponent::GenerateEmbedding(const FString& Text)
     if (n_tokens < 0) return Result;
     tokens.resize(n_tokens);
 
+    // CRITICAL FIX: Prevent batch overflow crash during heavy embedding
+    if (tokens.size() > 4000) {
+        tokens.resize(4000);
+    }
+
     llama_batch batch = llama_batch_get_one(tokens.data(), tokens.size());
     if (llama_decode(EmbedContext, batch) != 0) return Result;
 
@@ -180,6 +219,11 @@ FString ULlamaRAGComponent::GenerateTextInternal(const FString& Prompt)
     std::vector<llama_token> tokens(StdPrompt.length() + 1);
     int n_tokens = llama_tokenize(vocab, StdPrompt.c_str(), StdPrompt.length(), tokens.data(), tokens.size(), true, false);
     tokens.resize(n_tokens);
+
+    // CRITICAL FIX: Prevent batch overflow crash during massive prompts
+    if (tokens.size() > 4000) {
+        tokens.resize(4000);
+    }
 
     llama_batch batch = llama_batch_get_one(tokens.data(), tokens.size());
     llama_decode(LlmContext, batch);
